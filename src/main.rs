@@ -40,7 +40,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         3 => "trace",
         _ => "error",
     };
-    Logger::try_with_str(logger_str)?.start()?;
+    Logger::try_with_str(logger_str)?
+        .adaptive_format_for_stderr(flexi_logger::AdaptiveFormat::Detailed)
+        .start()?;
 
     match &cli.command {
         Some(Commands::Devs {}) => {

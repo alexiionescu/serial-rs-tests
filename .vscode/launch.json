@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0", 
+    "configurations": [
+        {
+            "type": "lldb", 
+            "request": "launch", 
+            "name": "Debug executable 'serial-rs-tests'", 
+            "cargo": { "args": ["build", "--bin=serial-rs-tests", "--package=serial-rs-tests"], "filter": {"name": "serial-rs-tests", "kind": "bin"} }, 
+            "args": ["-vv", "test", "-p", "/dev/cu.SLAB_USBtoUART"], 
+            "cwd": "${workspaceFolder}"
+        }, 
+        {
+            "type": "lldb", 
+            "request": "launch", 
+            "name": "Debug unit tests in executable 'serial-rs-tests'", 
+            "cargo": { "args": ["test", "--no-run", "--bin=serial-rs-tests", "--package=serial-rs-tests"], "filter": {"name": "serial-rs-tests", "kind": "bin"} }, 
+            "args": [], 
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

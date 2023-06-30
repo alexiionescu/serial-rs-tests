@@ -1,62 +1,218 @@
-use std::{thread::sleep, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc, RwLock,
+    },
+    thread::{self, sleep},
+    time::Duration,
+};
 
-use log::{debug, trace};
+use log::{debug, error, info, trace, warn};
+use rand_distr::{Distribution, Normal};
 
 // rx_fifo_full_threshold
 const READ_BUF_SIZE: usize = 128;
 // EOT (CTRL-D)
 const AT_CMD: u8 = 0x04;
+const AT_ESC: u8 = 0x1b;
 
 // max message size to receive
 // leave some extra space for AT-CMD characters
-const MAX_BUFFER_SIZE: usize = 2 * READ_BUF_SIZE + 20;
+const MAX_BUFFER_SIZE: usize = 5 * READ_BUF_SIZE + 20;
+const RESET_BUFFER_SIZE: usize = MAX_BUFFER_SIZE - READ_BUF_SIZE;
 
+type UartVec = Vec<u8>;
+
+#[inline]
+fn pop_escaped(buf: &[u8], offset: &mut usize) -> Option<u8> {
+    if buf.is_empty() {
+        return None;
+    }
+    if buf[0] == AT_ESC {
+        if buf.len() == 1 {
+            None
+        } else {
+            *offset += 2;
+            Some(buf[1])
+        }
+    } else {
+        *offset += 1;
+        Some(buf[0])
+    }
+}
+trait PushEscape {
+    fn push_escaped(&mut self, b: u8);
+    fn pop_escaped(&mut self) -> Option<u8>;
+}
+
+impl PushEscape for UartVec {
+    fn push_escaped(&mut self, b: u8) {
+        if b == AT_CMD || b == AT_ESC {
+            self.push(AT_ESC);
+            self.push(b);
+        } else {
+            self.push(b);
+        }
+    }
+    fn pop_escaped(&mut self) -> Option<u8> {
+        let b = self.pop()?;
+        if b == AT_ESC {
+            self.pop()
+        } else {
+            Some(b)
+        }
+    }
+}
+
+struct WriteData {
+    seq_no: AtomicU16,
+    wbuf: UartVec,
+}
 pub fn test(port: &String, baud: u32) {
     let mut serial = serialport::new(port, baud)
         .open()
         .expect("Failed to open port");
 
-    let mut rbuf = vec![0; MAX_BUFFER_SIZE];
-    let mut wbuf = Vec::with_capacity(MAX_BUFFER_SIZE);
-    wbuf.resize(8, b'0'); // header
-    'init: for i in 1..500 {
-        let hex_str = format!("{}", i);
-        for c in hex_str.as_bytes() {
-            if wbuf.push_within_capacity(*c).is_err() {
-                break 'init;
-            }
-        }
-    }
+    let write_data = Arc::new(RwLock::new(WriteData {
+        seq_no: AtomicU16::new(0),
+        wbuf: Vec::with_capacity(MAX_BUFFER_SIZE),
+    }));
+    let wlock_data = write_data.clone();
+    let normal = Normal::new(500.0, 100.0).unwrap();
 
-    let mut seq_no: u16 = 0;
-    loop {
-        if let Ok(n) = serial.read(rbuf.as_mut_slice()) {
-            if n > 0 && (n > 1 || rbuf[0] != AT_CMD) {
-                debug!("received {n} bytes {:02X?}", &rbuf[..8]);
-                trace!("received {:02X?}", &rbuf[..n]);
-                let str = String::from_utf8(rbuf[..n].to_vec()).unwrap();
-                println!("{}", &str);
-            }
-        } else {
-            sleep(Duration::from_secs(5));
-            debug!("write {} bytes {:02X?}", wbuf.len(), &wbuf[..4]);
-            seq_no += 1;
-            wbuf[..4].copy_from_slice(format!("{seq_no:04X}").as_bytes());
-            serial.write_all(&wbuf).ok();
-            serial.flush().ok();
+    let mut wserial = serial
+        .try_clone()
+        .expect("Failed to clone port for writing");
+
+    thread::spawn(move || loop {
+        sleep(Duration::from_secs(5));
+        let mut wdata = wlock_data.write().unwrap();
+        if wdata.seq_no.load(Ordering::Relaxed) > 0 {
+            warn!("last send was NG");
+        }
+        let len = normal.sample(&mut rand::thread_rng()) as usize;
+        let seq_no = wdata.seq_no.fetch_add(1, Ordering::SeqCst) + 1;
+
+        wdata.wbuf.clear();
+        let b = (seq_no) as u8;
+        wdata.wbuf.push_escaped(b);
+        let b = (seq_no >> 8) as u8;
+        wdata.wbuf.push_escaped(b);
+        wdata.wbuf.push_escaped(0xFF); // dummy message type
+        for i in 0..len {
+            wdata.wbuf.push_escaped(i as u8);
+        }
+        let mut csum: u16 = 0;
+        for b in &wdata.wbuf {
+            csum += *b as u16;
+            csum &= 0xFF;
+        }
+        wdata.wbuf.push_escaped(csum as u8);
+
+        debug!(
+            "send SEQ:{} {} bytes CKSUM:{} {:02X?} ... {:02X?}",
+            seq_no,
+            len,
+            csum,
+            &wdata.wbuf[..10],
+            &wdata.wbuf[(wdata.wbuf.len() - 8)..]
+        );
+        trace!("send bin\n{:02X?}", &wdata.wbuf);
+        wdata.seq_no.store(seq_no, Ordering::SeqCst);
+        wserial.write_all(&wdata.wbuf).ok();
+        wserial.flush().ok();
+
+        sleep(Duration::from_millis(100));
+        wserial.write_all(&[AT_CMD]).ok();
+        wserial.flush().ok();
+        sleep(Duration::from_millis(200));
+        let mut repeat_at_cmd = 1;
+        while wserial.bytes_to_read().unwrap() == 0 && repeat_at_cmd < 10 {
+            repeat_at_cmd += 1;
             sleep(Duration::from_millis(200));
-            debug!("write at_cmd bytes");
-            serial.write_all(&[AT_CMD]).ok();
-            serial.flush().ok();
-            loop {
-                sleep(Duration::from_millis(200));
-                if serial.bytes_to_read().unwrap() > 0 {
-                    break;
-                } else {
-                    serial.write_all(&[AT_CMD]).ok();
-                    serial.flush().ok();
+
+            wserial.write_all(&[AT_CMD]).ok();
+            wserial.flush().ok();
+        }
+        debug!("sent at_cmd {repeat_at_cmd} bytes");
+    });
+
+    let mut start = 0;
+    let mut offset = 0;
+    let mut rbuf = vec![0; MAX_BUFFER_SIZE];
+    loop {
+        if let Ok(n) = serial.read(&mut rbuf[start..]) {
+            debug!("received {n} bytes");
+            trace!(
+                "received txt\n{}",
+                &rbuf[start..(start + n)].escape_ascii().to_string()
+            );
+            trace!("received bin\n{:02X?}", &rbuf[start..(start + n)]);
+            let wdata = write_data.read().unwrap();
+            for i in start..(start + n) {
+                if rbuf[i] == AT_CMD && (i == 0 || rbuf[i - 1] != AT_ESC) {
+                    if i > offset {
+                        let recv_size = i - offset - 1;
+                        if recv_size >= 3 {
+                            let recv_end = i - 1;
+                            let mut csum: u16 = 0;
+                            for b in &rbuf[offset..recv_end] {
+                                csum += *b as u16;
+                                csum &= 0xFF;
+                            }
+                            if csum == rbuf[recv_end] as u16 {
+                                let mut seq_no: u16 =
+                                    pop_escaped(&rbuf[offset..recv_end], &mut offset).unwrap()
+                                        as u16;
+                                seq_no += (pop_escaped(&rbuf[offset..recv_end], &mut offset)
+                                    .unwrap() as u16)
+                                    << 8;
+                                if wdata
+                                    .seq_no
+                                    .compare_exchange(
+                                        seq_no,
+                                        0,
+                                        Ordering::Acquire,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    debug!(
+                                        "recv-ack {} bytes {:02X?} ... {:02X?}",
+                                        recv_size,
+                                        &rbuf[offset..(offset + 2)],
+                                        &rbuf[(recv_end - 2)..i]
+                                    );
+                                    trace!("recv-ack bin\n{:02X?}", &rbuf[offset..recv_end]);
+                                    info!("recv ACK");
+                                } else {
+                                    debug!(
+                                        "recv-new SEQ:{} {} bytes {:02X?} ... {:02X?}",
+                                        seq_no,
+                                        recv_size,
+                                        &rbuf[offset..(offset + 3)],
+                                        &rbuf[(recv_end - 3)..i]
+                                    );
+                                    trace!("recv-new bin\n{:02X?}", &rbuf[offset..recv_end]);
+                                }
+                            } else {
+                                error!(
+                                    "Invalid Check Sum: calculated {} != {} received",
+                                    csum, rbuf[recv_end]
+                                );
+                            }
+                        }
+                    }
+                    offset = i + 1;
                 }
             }
+            start += n;
+            if offset == start || start >= RESET_BUFFER_SIZE {
+                start = 0;
+                offset = 0;
+            }
+        } else {
+            sleep(Duration::from_millis(500));
         }
     }
 }
