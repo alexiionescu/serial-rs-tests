@@ -15,6 +15,7 @@ const READ_BUF_SIZE: usize = 128;
 // EOT (CTRL-D)
 const AT_CMD: u8 = 0x04;
 const AT_ESC: u8 = 0x1b;
+const AT_ESC_MASK: u8 = 0x30;
 
 // max message size to receive
 // leave some extra space for AT-CMD characters
@@ -33,7 +34,10 @@ fn pop_escaped(buf: &[u8], offset: &mut usize) -> Option<u8> {
             None
         } else {
             *offset += 2;
-            Some(buf[1])
+            match buf[1] {
+                AT_ESC => Some(AT_ESC),
+                b => Some(b & !AT_ESC_MASK),
+            }
         }
     } else {
         *offset += 1;
@@ -47,17 +51,27 @@ trait PushEscape {
 
 impl PushEscape for UartVec {
     fn push_escaped(&mut self, b: u8) {
-        if b == AT_CMD || b == AT_ESC {
-            self.push(AT_ESC);
-            self.push(b);
-        } else {
-            self.push(b);
+        match b {
+            AT_CMD => {
+                self.push(AT_ESC);
+                self.push(b | AT_ESC_MASK);
+            }
+            AT_ESC => {
+                self.push(AT_ESC);
+                self.push(b);
+            }
+            b => self.push(b),
         }
     }
+
     fn pop_escaped(&mut self) -> Option<u8> {
         let b = self.pop()?;
         if b == AT_ESC {
-            self.pop()
+            match self.pop() {
+                Some(b) if b == AT_ESC => Some(AT_ESC),
+                Some(b) => Some(b & !AT_ESC_MASK),
+                _ => None,
+            }
         } else {
             Some(b)
         }
@@ -127,7 +141,7 @@ pub fn test(port: &String, baud: u32) {
         wserial.flush().ok();
         sleep(Duration::from_millis(200));
         let mut repeat_at_cmd = 1;
-        while wserial.bytes_to_read().unwrap() == 0 && repeat_at_cmd < 10 {
+        while wserial.bytes_to_read().unwrap() == 0 && repeat_at_cmd < 6 {
             repeat_at_cmd += 1;
             sleep(Duration::from_millis(200));
 
@@ -142,7 +156,7 @@ pub fn test(port: &String, baud: u32) {
     let mut rbuf = vec![0; MAX_BUFFER_SIZE];
     loop {
         if let Ok(n) = serial.read(&mut rbuf[start..]) {
-            debug!("received {n} bytes");
+            trace!("received {n} bytes");
             trace!(
                 "received txt\n{}",
                 &rbuf[start..(start + n)].escape_ascii().to_string()
