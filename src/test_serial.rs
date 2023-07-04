@@ -98,57 +98,68 @@ pub fn test(port: &String, baud: u32) {
         .try_clone()
         .expect("Failed to clone port for writing");
 
-    thread::spawn(move || loop {
-        sleep(Duration::from_secs(5));
-        let mut wdata = wlock_data.write().unwrap();
-        if wdata.seq_no.load(Ordering::Relaxed) > 0 {
-            warn!("last send was NG");
-        }
-        let len = normal.sample(&mut rand::thread_rng()) as usize;
-        let seq_no = wdata.seq_no.fetch_add(1, Ordering::SeqCst) + 1;
+    thread::spawn(move || {
+        let mut seq_no = 0;
+        loop {
+            sleep(Duration::from_secs(5));
+            let mut wdata = wlock_data.write().unwrap();
+            if wdata.seq_no.load(Ordering::Relaxed) > 0 {
+                warn!("last send was NG");
+            }
+            let len = normal.sample(&mut rand::thread_rng()) as usize;
+            seq_no += 1;
 
-        wdata.wbuf.clear();
-        let b = (seq_no) as u8;
-        wdata.wbuf.push_escaped(b);
-        let b = (seq_no >> 8) as u8;
-        wdata.wbuf.push_escaped(b);
-        wdata.wbuf.push_escaped(0xFF); // dummy message type
-        for i in 0..len {
-            wdata.wbuf.push_escaped(i as u8);
-        }
-        let mut csum: u16 = 0;
-        for b in &wdata.wbuf {
-            csum += *b as u16;
-            csum &= 0xFF;
-        }
-        wdata.wbuf.push_escaped(csum as u8);
+            wdata.wbuf.clear();
+            let b = (seq_no) as u8;
+            wdata.wbuf.push_escaped(b);
+            let b = (seq_no >> 8) as u8;
+            wdata.wbuf.push_escaped(b);
+            wdata.wbuf.push_escaped(0xFF); // dummy message type
+            for i in 0..len {
+                wdata.wbuf.push_escaped(i as u8);
+            }
+            let mut csum: u16 = 0;
+            for b in &wdata.wbuf {
+                csum += *b as u16;
+                csum &= 0xFF;
+            }
+            wdata.wbuf.push_escaped(csum as u8);
 
-        debug!(
-            "send SEQ:{} {} bytes CKSUM:{} {:02X?} ... {:02X?}",
-            seq_no,
-            len,
-            csum,
-            &wdata.wbuf[..10],
-            &wdata.wbuf[(wdata.wbuf.len() - 8)..]
-        );
-        trace!("send bin\n{:02X?}", &wdata.wbuf);
-        wdata.seq_no.store(seq_no, Ordering::SeqCst);
-        wserial.write_all(&wdata.wbuf).ok();
-        wserial.flush().ok();
+            debug!(
+                "send SEQ:{} {} bytes CKSUM:{} {:02X?} ... {:02X?}",
+                seq_no,
+                len,
+                csum,
+                &wdata.wbuf[..10],
+                &wdata.wbuf[(wdata.wbuf.len() - 8)..]
+            );
+            trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
+            // trace!("send bin\n{:02X?}", &wdata.wbuf);
+            wdata.seq_no.store(seq_no, Ordering::SeqCst);
+            wdata.wbuf.push(AT_CMD);
 
-        sleep(Duration::from_millis(100));
-        wserial.write_all(&[AT_CMD]).ok();
-        wserial.flush().ok();
-        sleep(Duration::from_millis(200));
-        let mut repeat_at_cmd = 1;
-        while wserial.bytes_to_read().unwrap() == 0 && repeat_at_cmd < 6 {
-            repeat_at_cmd += 1;
-            sleep(Duration::from_millis(200));
-
-            wserial.write_all(&[AT_CMD]).ok();
+            wserial.write_all(&wdata.wbuf).ok();
             wserial.flush().ok();
+
+            #[cfg(feature = "async")]
+            {
+                sleep(Duration::from_millis(100));
+                wserial.write_all(&[AT_CMD]).ok();
+                wserial.flush().ok();
+                sleep(Duration::from_millis(200));
+                let mut repeat_at_cmd = 1;
+                while wserial.bytes_to_read().unwrap() == 0
+                    && repeat_at_cmd < wdata.wbuf.len() / 100 + 3
+                {
+                    repeat_at_cmd += 1;
+                    sleep(Duration::from_millis(200));
+
+                    wserial.write_all(&[AT_CMD]).ok();
+                    wserial.flush().ok();
+                }
+                debug!("sent at_cmd {repeat_at_cmd} bytes");
+            }
         }
-        debug!("sent at_cmd {repeat_at_cmd} bytes");
     });
 
     let mut start = 0;
@@ -161,7 +172,7 @@ pub fn test(port: &String, baud: u32) {
                 "received txt\n{}",
                 &rbuf[start..(start + n)].escape_ascii().to_string()
             );
-            trace!("received bin\n{:02X?}", &rbuf[start..(start + n)]);
+            // trace!("received bin\n{:02X?}", &rbuf[start..(start + n)]);
             let wdata = write_data.read().unwrap();
             for i in start..(start + n) {
                 if rbuf[i] == AT_CMD && (i == 0 || rbuf[i - 1] != AT_ESC) {
@@ -175,39 +186,51 @@ pub fn test(port: &String, baud: u32) {
                                 csum &= 0xFF;
                             }
                             if csum == rbuf[recv_end] as u16 {
-                                let mut seq_no: u16 =
-                                    pop_escaped(&rbuf[offset..recv_end], &mut offset).unwrap()
-                                        as u16;
-                                seq_no += (pop_escaped(&rbuf[offset..recv_end], &mut offset)
-                                    .unwrap() as u16)
-                                    << 8;
-                                if wdata
-                                    .seq_no
-                                    .compare_exchange(
-                                        seq_no,
-                                        0,
-                                        Ordering::Acquire,
-                                        Ordering::Relaxed,
-                                    )
-                                    .is_ok()
+                                if rbuf[offset] == 0
+                                    && rbuf[offset + 1] == 0
+                                    && rbuf[offset + 2] == 0x7E
                                 {
-                                    debug!(
-                                        "recv-ack {} bytes {:02X?} ... {:02X?}",
-                                        recv_size,
-                                        &rbuf[offset..(offset + 2)],
-                                        &rbuf[(recv_end - 2)..i]
+                                    //debug print
+                                    println!(
+                                        "{}",
+                                        &rbuf[(offset + 3)..recv_end].escape_ascii().to_string()
                                     );
-                                    trace!("recv-ack bin\n{:02X?}", &rbuf[offset..recv_end]);
-                                    info!("recv ACK");
                                 } else {
-                                    debug!(
-                                        "recv-new SEQ:{} {} bytes {:02X?} ... {:02X?}",
-                                        seq_no,
-                                        recv_size,
-                                        &rbuf[offset..(offset + 3)],
-                                        &rbuf[(recv_end - 3)..i]
-                                    );
-                                    trace!("recv-new bin\n{:02X?}", &rbuf[offset..recv_end]);
+                                    let mut seq_no: u16 =
+                                        pop_escaped(&rbuf[offset..recv_end], &mut offset).unwrap()
+                                            as u16;
+                                    seq_no += (pop_escaped(&rbuf[offset..recv_end], &mut offset)
+                                        .unwrap()
+                                        as u16)
+                                        << 8;
+                                    if wdata
+                                        .seq_no
+                                        .compare_exchange(
+                                            seq_no,
+                                            0,
+                                            Ordering::Acquire,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        debug!(
+                                            "recv-ack {} bytes {:02X?} ... {:02X?}",
+                                            recv_size,
+                                            &rbuf[offset..(offset + 2)],
+                                            &rbuf[(recv_end - 2)..i]
+                                        );
+                                        // trace!("recv-ack bin\n{:02X?}", &rbuf[offset..recv_end]);
+                                        info!("recv ACK");
+                                    } else {
+                                        debug!(
+                                            "recv-new SEQ:{} {} bytes {:02X?} ... {:02X?}",
+                                            seq_no,
+                                            recv_size,
+                                            &rbuf[offset..(offset + 3)],
+                                            &rbuf[(recv_end - 3)..i]
+                                        );
+                                        // trace!("recv-new bin\n{:02X?}", &rbuf[offset..recv_end]);
+                                    }
                                 }
                             } else {
                                 error!(
