@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use std::{
     sync::{
         atomic::{AtomicU16, Ordering},
@@ -9,6 +11,8 @@ use std::{
 
 use log::{debug, error, info, trace, warn};
 use rand_distr::{Distribution, Normal};
+
+use crate::ConnectArgs;
 
 // rx_fifo_full_threshold
 const READ_BUF_SIZE: usize = 128;
@@ -82,85 +86,88 @@ struct WriteData {
     seq_no: AtomicU16,
     wbuf: UartVec,
 }
-pub fn test(port: &String, baud: u32) {
-    let mut serial = serialport::new(port, baud)
+pub fn test(connect_args: ConnectArgs, no_send: bool) {
+    let mut serial = serialport::new(connect_args.port, connect_args.baud)
         .open()
         .expect("Failed to open port");
-
     let write_data = Arc::new(RwLock::new(WriteData {
         seq_no: AtomicU16::new(0),
         wbuf: Vec::with_capacity(MAX_BUFFER_SIZE),
     }));
-    let wlock_data = write_data.clone();
-    let normal = Normal::new(500.0, 100.0).unwrap();
 
-    let mut wserial = serial
-        .try_clone()
-        .expect("Failed to clone port for writing");
+    if !no_send {
+        let wlock_data = write_data.clone();
+        let normal = Normal::new(500.0, 100.0).unwrap();
+        let mut wserial = serial
+            .try_clone()
+            .expect("Failed to clone port for writing");
 
-    thread::spawn(move || {
-        let mut seq_no = 0;
-        loop {
-            sleep(Duration::from_secs(5));
-            let mut wdata = wlock_data.write().unwrap();
-            if wdata.seq_no.load(Ordering::Relaxed) > 0 {
-                warn!("last send was NG");
-            }
-            let len = normal.sample(&mut rand::thread_rng()) as usize;
-            seq_no += 1;
+        thread::spawn(move || {
+            let mut seq_no = 0;
+            loop {
+                sleep(Duration::from_secs(10));
+                let mut wdata = wlock_data.write().unwrap();
+                if wdata.seq_no.load(Ordering::Relaxed) > 0 {
+                    warn!("last send was NG");
+                }
+                let len = normal.sample(&mut rand::thread_rng()) as usize;
+                seq_no += 1;
 
-            wdata.wbuf.clear();
-            let b = (seq_no) as u8;
-            wdata.wbuf.push_escaped(b);
-            let b = (seq_no >> 8) as u8;
-            wdata.wbuf.push_escaped(b);
-            wdata.wbuf.push_escaped(0xFF); // dummy message type
-            for i in 0..len {
-                wdata.wbuf.push_escaped(i as u8);
-            }
-            let mut csum: u16 = 0;
-            for b in &wdata.wbuf {
-                csum += *b as u16;
-                csum &= 0xFF;
-            }
-            wdata.wbuf.push_escaped(csum as u8);
+                wdata.wbuf.clear();
+                let b = (seq_no) as u8;
+                wdata.wbuf.push_escaped(b);
+                let b = (seq_no >> 8) as u8;
+                wdata.wbuf.push_escaped(b);
+                wdata.wbuf.push_escaped(0xFF); // dummy message type
+                for i in 0..len {
+                    wdata.wbuf.push_escaped(i as u8);
+                }
+                let mut csum: u16 = 0;
+                for b in &wdata.wbuf {
+                    csum += *b as u16;
+                    csum &= 0xFF;
+                }
+                wdata.wbuf.push_escaped(csum as u8);
 
-            debug!(
-                "send SEQ:{} {} bytes CKSUM:{} {:02X?} ... {:02X?}",
-                seq_no,
-                len,
-                csum,
-                &wdata.wbuf[..10],
-                &wdata.wbuf[(wdata.wbuf.len() - 8)..]
-            );
-            trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
-            // trace!("send bin\n{:02X?}", &wdata.wbuf);
-            wdata.seq_no.store(seq_no, Ordering::SeqCst);
-            wdata.wbuf.push(AT_CMD);
+                debug!(
+                    "send SEQ:{} {} bytes CKSUM:{} {:02X?} ... {:02X?}",
+                    seq_no,
+                    len,
+                    csum,
+                    &wdata.wbuf[..10],
+                    &wdata.wbuf[(wdata.wbuf.len() - 8)..]
+                );
+                trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
+                // trace!("send bin\n{:02X?}", &wdata.wbuf);
+                wdata.seq_no.store(seq_no, Ordering::SeqCst);
 
-            wserial.write_all(&wdata.wbuf).ok();
-            wserial.flush().ok();
+                #[cfg(not(feature = "async"))]
+                wdata.wbuf.push(AT_CMD);
 
-            #[cfg(feature = "async")]
-            {
-                sleep(Duration::from_millis(100));
-                wserial.write_all(&[AT_CMD]).ok();
+                wserial.write_all(&wdata.wbuf).ok();
                 wserial.flush().ok();
-                sleep(Duration::from_millis(200));
-                let mut repeat_at_cmd = 1;
-                while wserial.bytes_to_read().unwrap() == 0
-                    && repeat_at_cmd < wdata.wbuf.len() / 100 + 3
-                {
-                    repeat_at_cmd += 1;
-                    sleep(Duration::from_millis(200));
 
+                #[cfg(feature = "async")]
+                {
+                    sleep(Duration::from_millis(10));
                     wserial.write_all(&[AT_CMD]).ok();
                     wserial.flush().ok();
+                    sleep(Duration::from_millis(200));
+                    let mut repeat_at_cmd = 1;
+                    while wserial.bytes_to_read().unwrap() == 0
+                        && repeat_at_cmd < wdata.wbuf.len() / 100 + 3
+                    {
+                        repeat_at_cmd += 1;
+                        sleep(Duration::from_millis(200));
+
+                        wserial.write_all(&[AT_CMD]).ok();
+                        wserial.flush().ok();
+                    }
+                    debug!("sent at_cmd {repeat_at_cmd} bytes");
                 }
-                debug!("sent at_cmd {repeat_at_cmd} bytes");
             }
-        }
-    });
+        });
+    }
 
     let mut start = 0;
     let mut offset = 0;
@@ -172,8 +179,7 @@ pub fn test(port: &String, baud: u32) {
                 "received txt\n{}",
                 &rbuf[start..(start + n)].escape_ascii().to_string()
             );
-            // trace!("received bin\n{:02X?}", &rbuf[start..(start + n)]);
-            let wdata = write_data.read().unwrap();
+            trace!("received bin\n{:02X?}", &rbuf[start..(start + n)]);
             for i in start..(start + n) {
                 if rbuf[i] == AT_CMD && (i == 0 || rbuf[i - 1] != AT_ESC) {
                     if i > offset {
@@ -195,7 +201,8 @@ pub fn test(port: &String, baud: u32) {
                                         "{}",
                                         &rbuf[(offset + 3)..recv_end].escape_ascii().to_string()
                                     );
-                                } else {
+                                } else if !no_send {
+                                    let wdata = write_data.read().unwrap();
                                     let mut seq_no: u16 =
                                         pop_escaped(&rbuf[offset..recv_end], &mut offset).unwrap()
                                             as u16;
@@ -203,6 +210,7 @@ pub fn test(port: &String, baud: u32) {
                                         .unwrap()
                                         as u16)
                                         << 8;
+
                                     if wdata
                                         .seq_no
                                         .compare_exchange(
@@ -231,12 +239,21 @@ pub fn test(port: &String, baud: u32) {
                                         );
                                         // trace!("recv-new bin\n{:02X?}", &rbuf[offset..recv_end]);
                                     }
+                                } else if recv_size > 5 {
+                                    debug!(
+                                        "recv {} bytes {:02X?} ... {:02X?}",
+                                        recv_size,
+                                        &rbuf[offset..(offset + 5)],
+                                        &rbuf[(recv_end - 5)..i]
+                                    );
+                                    trace!("recv bin\n{:02X?}", &rbuf[offset..recv_end]);
                                 }
                             } else {
                                 error!(
                                     "Invalid Check Sum: calculated {} != {} received",
                                     csum, rbuf[recv_end]
                                 );
+                                trace!("recv bin\n{:02X?}", &rbuf[offset..recv_end]);
                             }
                         }
                     }
@@ -252,4 +269,19 @@ pub fn test(port: &String, baud: u32) {
             sleep(Duration::from_millis(500));
         }
     }
+}
+
+pub(crate) fn generate(length: u16) {
+    let mut csum: u16 = 0;
+    for i in 1..length {
+        print!("{}", i % 10);
+        csum += 0x30 + (i % 10);
+        csum &= 0xff;
+    }
+    while !(csum as u8).is_ascii_alphanumeric() {
+        print!("0");
+        csum += 0x30;
+        csum &= 0xff;
+    }
+    println!("{}", (csum as u8) as char);
 }

@@ -15,4 +15,5 @@ rand_distr = "0.4.3"
 serialport = "4.2.1"
 
 [features]
+default = ["async"]
 async = []
