@@ -28,10 +28,14 @@ pub struct ConnectArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    ///
+    /// Generators
     Generate {
         #[arg(short, long, default_value_t = 250)]
-        length: u16,
+        length: usize,
+        #[arg(short, long)]
+        bin: bool,
+        #[arg(short, long)]
+        checksum: Option<u8>,
     },
     /// show all serial ports
     Devs {},
@@ -41,6 +45,14 @@ enum Commands {
         connect_args: ConnectArgs,
         #[arg(long)]
         no_send: bool,
+        #[arg(long)]
+        load_send: bool,
+        #[arg(long)]
+        at_cmd: bool,
+        #[arg(long)]
+        fix_send: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        send_time: u16,
     },
 }
 
@@ -67,8 +79,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Commands::Test {
             connect_args,
             no_send,
-        }) => test_serial::test(connect_args, no_send),
-        Some(Commands::Generate { length }) => test_serial::generate(length),
+            load_send,
+            at_cmd,
+            fix_send,
+            send_time,
+        }) => test_serial::test(
+            connect_args,
+            no_send,
+            load_send,
+            at_cmd,
+            fix_send,
+            send_time,
+        ),
+        Some(Commands::Generate {
+            length,
+            bin,
+            checksum,
+        }) => {
+            if bin {
+                test_serial::generate_bin(length, checksum);
+            } else {
+                test_serial::generate(length);
+            }
+        }
         None => {}
     }
     Ok(())
