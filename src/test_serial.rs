@@ -97,8 +97,8 @@ pub fn test(
     no_send: bool,
     load_send: bool,
     at_cmd: bool,
-    fix_send: Option<String>,
-    send_time: u16,
+    send: Vec<String>,
+    send_time: Vec<u64>,
 ) {
     let mut serial = serialport::new(connect_args.port, connect_args.baud)
         .open()
@@ -123,7 +123,8 @@ pub fn test(
         let mut wserial = serial
             .try_clone()
             .expect("Failed to clone port for writing");
-        let hex_fix_send = fix_send.map(|s| hex::decode(s).unwrap());
+        let mut hex_sends_iter = send.into_iter().map(|s| hex::decode(s).unwrap()).cycle();
+        let mut send_time_iter = send_time.into_iter().cycle();
 
         thread::spawn(move || {
             let (lock, cvar) = &*pair;
@@ -131,15 +132,20 @@ pub fn test(
             let mut seq_no = 0;
             let mut total_sent: usize = 0;
             let mut total_sent_bytes: usize = 0;
+            let mut total_nack: usize = 0;
             loop {
                 if !load_send {
                     let started = lock.lock().unwrap();
-                    cvar.wait_timeout(started, Duration::from_secs(send_time as u64))
-                        .ok();
+                    cvar.wait_timeout(
+                        started,
+                        Duration::from_secs(send_time_iter.next().unwrap_or(60)),
+                    )
+                    .ok();
                 }
                 let mut wdata = wlock_data.write().unwrap();
                 if !load_send && wdata.seq_no.load(Ordering::Relaxed) > 0 {
                     warn!("last send was NG");
+                    total_nack += 1;
                 }
 
                 seq_no += 1;
@@ -155,7 +161,7 @@ pub fn test(
                         wdata.wbuf.push(b);
                     }
                     adata.clear();
-                } else if let Some(ref hex) = hex_fix_send {
+                } else if let Some(hex) = hex_sends_iter.next() {
                     hex.iter().for_each(|b| wdata.wbuf.push_escaped(*b));
                 } else {
                     wdata.wbuf.push_escaped(0xFF); // dummy message type
@@ -222,8 +228,11 @@ pub fn test(
                 }
 
                 total_sent += 1;
-                if seq_no % 1024 == 0 {
-                    info!("sent {:05} bytes: {:07}", total_sent, total_sent_bytes);
+                if (!load_send && seq_no % 16 == 0) || seq_no % 1024 == 0 {
+                    info!(
+                        "STATS: sent:{:05} nack:{:03} {:07}B ",
+                        total_sent, total_nack, total_sent_bytes
+                    );
                 }
             }
         });
@@ -238,7 +247,11 @@ pub fn test(
             trace!("received {n} bytes");
             trace!(
                 "received txt\n{}",
-                &rbuf[start..(start + n)].escape_ascii().to_string()
+                &rbuf[start..(start + n)]
+                    .escape_ascii()
+                    .to_string()
+                    .replace("\\x04", " <EOT>\n")
+                    .replace("\\r\\n", " <CR><LF>\n")
             );
             trace!(
                 "received bin\n{}",

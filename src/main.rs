@@ -49,10 +49,10 @@ enum Commands {
         load_send: bool,
         #[arg(long)]
         at_cmd: bool,
-        #[arg(long)]
-        fix_send: Option<String>,
-        #[arg(long, default_value_t = 60)]
-        send_time: u16,
+        #[arg(long, value_parser, num_args = 0.., value_delimiter = ' ')]
+        send: Vec<String>,
+        #[arg(long, value_parser, num_args = 0.., value_delimiter = ' ')]
+        send_time: Vec<u64>,
     },
 }
 
@@ -81,16 +81,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             no_send,
             load_send,
             at_cmd,
-            fix_send,
+            send,
             send_time,
-        }) => test_serial::test(
-            connect_args,
-            no_send,
-            load_send,
-            at_cmd,
-            fix_send,
-            send_time,
-        ),
+        }) => test_serial::test(connect_args, no_send, load_send, at_cmd, send, send_time),
         Some(Commands::Generate {
             length,
             bin,
