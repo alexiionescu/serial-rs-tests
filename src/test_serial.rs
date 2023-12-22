@@ -12,7 +12,10 @@ use std::{
 use log::{debug, error, info, trace, warn};
 use rand_distr::{Distribution, Normal};
 
-use crate::ConnectArgs;
+use crate::{
+    test_esp::{EspTester, MSG_TYPE_REQ_CONFIG, MSG_TYPE_RES_CONFIG},
+    ConnectArgs,
+};
 
 // rx_fifo_full_threshold
 const READ_BUF_SIZE: usize = 128;
@@ -25,12 +28,6 @@ const AT_ESC_MASK: u8 = 0x30;
 // leave some extra space for AT-CMD characters
 const MAX_BUFFER_SIZE: usize = 5 * READ_BUF_SIZE + 20;
 const RESET_BUFFER_SIZE: usize = MAX_BUFFER_SIZE - READ_BUF_SIZE;
-
-const MSG_TYPE_RES: u8 = 0x20;
-// request 0x00 - 0x1F
-// responses 0x20 - 0x3f = (0x00 - 0x1F | MSG_TYPE_RES)
-const MSG_TYPE_REQ_CONFIG: u8 = 0x00;
-const MSG_TYPE_RES_CONFIG: u8 = MSG_TYPE_REQ_CONFIG | MSG_TYPE_RES;
 
 type UartVec = Vec<u8>;
 
@@ -53,6 +50,15 @@ fn pop_escaped(buf: &[u8], offset: &mut usize) -> Option<u8> {
         *offset += 1;
         Some(buf[0])
     }
+}
+#[inline]
+pub(crate) fn pop_all_escaped(buf: &[u8]) -> Vec<u8> {
+    let mut offset = 0;
+    let mut out = Vec::with_capacity(buf.len());
+    while let Some(b) = pop_escaped(&buf[offset..], &mut offset) {
+        out.push(b);
+    }
+    out
 }
 trait PushEscape {
     fn push_escaped(&mut self, b: u8);
@@ -96,9 +102,10 @@ pub fn test(
     connect_args: ConnectArgs,
     no_send: bool,
     load_send: bool,
-    at_cmd: bool,
+    mut at_cmd: bool,
     send: Vec<String>,
     send_time: Vec<u64>,
+    esp_test: bool,
 ) {
     let mut serial = serialport::new(connect_args.port, connect_args.baud)
         .open()
@@ -107,7 +114,11 @@ pub fn test(
         seq_no: AtomicU16::new(0),
         wbuf: Vec::with_capacity(MAX_BUFFER_SIZE),
     }));
+    if esp_test {
+        at_cmd = true;
+    }
     let answer_data = Arc::new(Mutex::new(UartVec::with_capacity(MAX_BUFFER_SIZE)));
+    let esp_tester = Arc::new(Mutex::new(EspTester::default()));
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = Arc::clone(&pair);
 
@@ -163,6 +174,8 @@ pub fn test(
                     adata.clear();
                 } else if let Some(hex) = hex_sends_iter.next() {
                     hex.iter().for_each(|b| wdata.wbuf.push_escaped(*b));
+                } else if esp_test {
+                    continue;
                 } else {
                     wdata.wbuf.push_escaped(0xFF); // dummy message type
                     let len = normal.sample(&mut rand::thread_rng()) as usize;
@@ -179,26 +192,26 @@ pub fn test(
                 wdata.seq_no.store(seq_no, Ordering::SeqCst);
 
                 if !load_send {
-                    if wdata.wbuf.len() < 20 {
+                    if wdata.wbuf.len() < 50 {
                         debug!(
-                            "send SEQ:{} {} bytes CKSUM:{} {:02X?}",
+                            "send SEQ:{:04X} {} bytes CKSUM:{} {}",
                             seq_no,
                             wdata.wbuf.len(),
                             csum,
-                            &wdata.wbuf,
+                            hex::encode(&wdata.wbuf),
                         );
                     } else {
                         debug!(
-                            "send SEQ:{} {} bytes CKSUM:{} {:02X?} ... {:02X?}",
+                            "send SEQ:{:04X} {} bytes CKSUM:{} {} ... {}",
                             seq_no,
                             wdata.wbuf.len(),
                             csum,
-                            &wdata.wbuf[..10],
-                            &wdata.wbuf[(wdata.wbuf.len() - 8)..]
+                            hex::encode(&wdata.wbuf[..25]),
+                            hex::encode(&wdata.wbuf[(wdata.wbuf.len() - 25)..])
                         );
                     }
                     trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
-                    trace!("send bin\n{}", hex::encode_upper(&wdata.wbuf));
+                    trace!("send bin\n{}", hex::encode(&wdata.wbuf));
                 }
                 wdata.wbuf.push(AT_CMD);
                 total_sent_bytes += wdata.wbuf.len();
@@ -252,13 +265,12 @@ pub fn test(
                     .to_string()
                     .replace("\\x04", " <EOT>\n")
                     .replace("\\r\\n", " <CR><LF>\n")
+                    .replace("\\r", " <CR>\n")
+                    .replace("\\n", " <LF>\n")
             );
-            trace!(
-                "received bin\n{}",
-                hex::encode_upper(&rbuf[start..(start + n)])
-            );
+            trace!("received bin\n{}", hex::encode(&rbuf[start..(start + n)]));
             for i in start..(start + n) {
-                if rbuf[i] == AT_CMD && (i == 0 || rbuf[i - 1] != AT_ESC) {
+                if rbuf[i] == AT_CMD {
                     if i > offset {
                         let recv_size = i - offset - 1;
                         if recv_size >= 3 {
@@ -268,11 +280,13 @@ pub fn test(
                             for b in &rbuf[offset..recv_end] {
                                 csum += *b as u32;
                             }
-                            if rbuf[recv_end - 1] == AT_ESC {
+                            if rbuf[recv_end - 1] == AT_ESC && rbuf[recv_end - 2] != AT_ESC {
                                 //un-escape checksum
                                 recv_end -= 1;
                                 csum -= AT_ESC as u32;
-                                recv_csum &= !AT_ESC_MASK as u32;
+                                if recv_csum != AT_ESC as u32 {
+                                    recv_csum &= !AT_ESC_MASK as u32;
+                                }
                             }
                             if csum & 0xFF == recv_csum {
                                 if rbuf[offset] == 0
@@ -295,6 +309,8 @@ pub fn test(
                                         << 8;
                                     let msg_type =
                                         pop_escaped(&rbuf[offset..recv_end], &mut offset).unwrap();
+                                    let _hdr_part =
+                                        pop_escaped(&rbuf[offset..recv_end], &mut offset).unwrap();
 
                                     if msg_type & 0x80 != 0
                                         && wdata
@@ -308,33 +324,36 @@ pub fn test(
                                             .is_ok()
                                     {
                                         debug!(
-                                            "recv-ack {} bytes {:02X?} ... {:02X?}",
+                                            "recv-ack SEQ:{:04X} T:{:02x} {} bytes {}",
+                                            seq_no,
+                                            msg_type,
                                             recv_size,
-                                            &rbuf[offset..(offset + 2)],
-                                            &rbuf[(recv_end - 2)..i]
+                                            hex::encode(&rbuf[offset..recv_end]),
                                         );
                                         // trace!("recv-ack bin\n{:02X?}", &rbuf[offset..recv_end]);
                                         info!("recv ACK for {seq_no}");
                                     } else {
-                                        if i - offset < 20 {
+                                        if i - offset < 50 {
                                             debug!(
-                                                "recv-new SEQ:{} {} bytes {:02X?}",
+                                                "recv-new SEQ:{:04X} T:{:02x} {} bytes {}",
                                                 seq_no,
+                                                msg_type,
                                                 recv_size,
-                                                &rbuf[offset..i]
+                                                hex::encode(&rbuf[offset..recv_end]),
                                             );
                                         } else {
                                             debug!(
-                                                "recv-new SEQ:{} {} bytes {:02X?} ... {:02X?}",
-                                                seq_no,
+                                                "recv-new SEQ:{:04X} T:{:02x} {} bytes {} ... {}",
+                                                u16::to_be(seq_no),
+                                                msg_type,
                                                 recv_size,
-                                                &rbuf[offset..(offset + 3)],
-                                                &rbuf[(recv_end - 3)..i]
+                                                hex::encode(&rbuf[offset..(offset + 25)]),
+                                                hex::encode(&rbuf[(recv_end - 25)..recv_end]),
                                             );
                                         }
                                         // trace!("recv-new bin\n{:02X?}", &rbuf[offset..recv_end]);
                                         if msg_type == MSG_TYPE_REQ_CONFIG {
-                                            info!("recv Req Config");
+                                            info!("<test> recv Req Config");
                                             let mut adata = answer_data.lock().unwrap();
                                             if adata.is_empty() {
                                                 {
@@ -352,6 +371,11 @@ pub fn test(
                                             } else {
                                                 warn!("Cannot send res Config because data queue not empty!");
                                             }
+                                        } else if esp_test {
+                                            let escaped_data =
+                                                pop_all_escaped(&rbuf[offset..recv_end]);
+                                            let mut esp = esp_tester.lock().unwrap();
+                                            esp.trace_esp_data(msg_type, &escaped_data[..]);
                                         }
                                     }
                                 } else if recv_size > 5 {
@@ -410,7 +434,7 @@ pub(crate) fn generate_bin(length: usize, checksum: Option<u8>) {
     for b in &wbuf {
         csum += *b as u32;
         csum &= 0xFF;
-        debug!("{:02X} -> {:02X}", *b, csum);
+        debug!("{:02x} -> {:02x}", *b, csum);
     }
     if let Some(cs) = checksum {
         while csum != cs as u32 {
@@ -418,10 +442,70 @@ pub(crate) fn generate_bin(length: usize, checksum: Option<u8>) {
             wbuf.push_escaped(b);
             csum += b as u32;
             csum &= 0xFF;
-            debug!("{:02X} -> {:02X}", b, csum);
+            debug!("{:02x} -> {:02x}", b, csum);
         }
     }
     wbuf.push_escaped(csum as u8);
     wbuf.push(AT_CMD);
-    println!("{}", hex::encode_upper(wbuf));
+    println!("{}", hex::encode(wbuf));
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    #[allow(dead_code)]
+    fn test_csum_serial() {
+        let mut data = "
+            1b1b007e00416867254e3ff0000000000000000000001b340018a0764ead1d30001b1b61040404
+            bc024100ffffffffffff1b340000000002bbffffffffffff02bca0764ead1d301b1b04
+            121b344100ffffffffffff1b34000000001b3411ffffffffffff1b3412a0764ead1d301b3404"
+            .to_string();
+        data.retain(|c| !c.is_whitespace());
+        let rbuf = hex::decode(data).unwrap();
+        let mut offset = 0;
+        let mut start = 0;
+        let n = rbuf.len();
+        let mut msg = 0;
+
+        for i in start..(start + n) {
+            if rbuf[i] == AT_CMD {
+                if i > offset {
+                    let recv_size = i - offset - 1;
+                    if recv_size >= 3 {
+                        let mut recv_end = i - 1;
+                        let mut recv_csum = rbuf[recv_end] as u32;
+                        let mut csum: u32 = 0;
+                        for b in &rbuf[offset..recv_end] {
+                            csum += *b as u32;
+                        }
+                        if rbuf[recv_end - 1] == AT_ESC && rbuf[recv_end - 2] != AT_ESC {
+                            //un-escape checksum
+                            recv_end -= 1;
+                            csum -= AT_ESC as u32;
+                            if recv_csum != AT_ESC as u32 {
+                                recv_csum &= !AT_ESC_MASK as u32;
+                            }
+                        }
+                        if msg == 1 || msg == 2 {
+                            assert_eq!(recv_end, i - 2);
+                        } else {
+                            assert_eq!(recv_end, i - 1);
+                        }
+                        assert_eq!(csum & 0xFF, recv_csum);
+                        msg += 1;
+                    }
+                }
+                offset = i + 1;
+            }
+        }
+        start += n;
+        if offset == start || start >= RESET_BUFFER_SIZE {
+            start = 0;
+            offset = 0;
+        }
+        assert_eq!(start, 0);
+        assert_eq!(offset, 0);
+    }
 }

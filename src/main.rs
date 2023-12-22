@@ -3,7 +3,8 @@
 use std::error::Error;
 
 use clap::{Args, Parser, Subcommand};
-use flexi_logger::Logger;
+use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, Naming};
+use log::Record;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -16,6 +17,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
+mod test_esp;
 mod test_serial;
 
 #[derive(Args)]
@@ -53,9 +55,25 @@ enum Commands {
         send: Vec<String>,
         #[arg(long, value_parser, num_args = 0.., value_delimiter = ' ')]
         send_time: Vec<u64>,
+        #[arg(long)]
+        esp_test: bool,
     },
 }
 
+pub fn logging_format(
+    w: &mut dyn std::io::Write,
+    now: &mut DeferredNow,
+    record: &Record,
+) -> Result<(), std::io::Error> {
+    let level = record.level();
+    write!(
+        w,
+        "{} {} {}",
+        now.format("%Y-%m-%d %H:%M:%S%.6f"),
+        level,
+        &record.args()
+    )
+}
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
@@ -66,7 +84,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => "error",
     };
     Logger::try_with_str(logger_str)?
-        .adaptive_format_for_stderr(flexi_logger::AdaptiveFormat::Detailed)
+        .format_for_stderr(logging_format)
+        .log_to_file(FileSpec::default().directory("log_files"))
+        .format_for_files(logging_format)
+        .rotate(
+            // If the program runs long enough,
+            Criterion::Age(Age::Day), // - create a new file every day
+            Naming::Timestamps,       // - let the rotated files have a timestamp in their name
+            Cleanup::KeepLogFiles(7), // - keep at most 7 log files
+        )
+        .duplicate_to_stderr(Duplicate::Warn)
         .start()?;
 
     match cli.command {
@@ -83,7 +110,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             at_cmd,
             send,
             send_time,
-        }) => test_serial::test(connect_args, no_send, load_send, at_cmd, send, send_time),
+            esp_test,
+        }) => test_serial::test(
+            connect_args,
+            no_send,
+            load_send,
+            at_cmd,
+            send,
+            send_time,
+            esp_test,
+        ),
         Some(Commands::Generate {
             length,
             bin,
