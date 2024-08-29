@@ -62,6 +62,7 @@ pub(crate) fn pop_all_escaped(buf: &[u8]) -> Vec<u8> {
 }
 trait PushEscape {
     fn push_escaped(&mut self, b: u8);
+    #[allow(unused)]
     fn pop_escaped(&mut self) -> Option<u8>;
 }
 

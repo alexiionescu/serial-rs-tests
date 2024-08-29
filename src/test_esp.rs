@@ -37,13 +37,13 @@ pub const MSG_TYPE_NOTIFY: u8 = 0x7E;
 // end notify types
 
 const ESP_NAMES: phf::Map<&'static str,&'static str> = phf::phf_map! {
-    "6867254e3ff0" => "First Repeater",
-    "7cdfa1dee298" => "Led Repeater",
-    "6867254d6258" => "R.Build Room",
-    "6867254f88f8" => "R.ESP.Support",
-    "6867254eed84" => "Red Repeater",
-    "7cdfa1dee03c" => "Support Exit",
-    "a0764ead1d30" => "COORDINATOR"
+    "6867254e3ff0" => "Tester 6867254e3ff0",
+    "7cdfa1dee298" => "Tester Call Lights",
+    "6867254d6258" => "COORDINATOR",
+    "6867254f88f8" => "Tester 6867254f88f8",
+    "6867254eed84" => "Tester Bed 103",
+    "7cdfa1dee03c" => "Tester 7cdfa1dee03c",
+    "a0764ead1d30" => "Tester a0764ead1d30"
 };
 
 #[derive(Debug)]
