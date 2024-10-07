@@ -211,7 +211,7 @@ pub fn test(
                             hex::encode(&wdata.wbuf[(wdata.wbuf.len() - 25)..])
                         );
                     }
-                    trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
+                    // trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
                     trace!("send bin\n{}", hex::encode(&wdata.wbuf));
                 }
                 wdata.wbuf.push(AT_CMD);
@@ -258,18 +258,17 @@ pub fn test(
     let (lock, cvar) = &*pair2;
     loop {
         if let Ok(n) = serial.read(&mut rbuf[start..]) {
-            trace!("received {n} bytes");
-            trace!(
-                "received txt\n{}",
-                &rbuf[start..(start + n)]
-                    .escape_ascii()
-                    .to_string()
-                    .replace("\\x04", " <EOT>\n")
-                    .replace("\\r\\n", " <CR><LF>\n")
-                    .replace("\\r", " <CR>\n")
-                    .replace("\\n", " <LF>\n")
-            );
-            trace!("received bin\n{}", hex::encode(&rbuf[start..(start + n)]));
+            trace!("received {n:3}: {}", hex::encode(&rbuf[start..(start + n)]));
+            // trace!(
+            //     "received txt\n{}",
+            //     &rbuf[start..(start + n)]
+            //         .escape_ascii()
+            //         .to_string()
+            //         .replace("\\x04", " <EOT>\n")
+            //         .replace("\\r\\n", " <CR><LF>\n")
+            //         .replace("\\r", " <CR>\n")
+            //         .replace("\\n", " <LF>\n")
+            // );
             for i in start..(start + n) {
                 if rbuf[i] == AT_CMD {
                     if i > offset {
@@ -295,7 +294,7 @@ pub fn test(
                                     && rbuf[offset + 2] == 0x7E
                                 {
                                     //debug print
-                                    println!(
+                                    info!(
                                         "{}",
                                         &rbuf[(offset + 3)..recv_end].escape_ascii().to_string()
                                     );
