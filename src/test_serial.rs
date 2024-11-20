@@ -28,6 +28,7 @@ const AT_ESC_MASK: u8 = 0x30;
 // leave some extra space for AT-CMD characters
 const MAX_BUFFER_SIZE: usize = 5 * READ_BUF_SIZE + 20;
 const RESET_BUFFER_SIZE: usize = MAX_BUFFER_SIZE - READ_BUF_SIZE;
+const MAX_RETRIES: u32 = 20;
 
 type UartVec = Vec<u8>;
 
@@ -145,7 +146,25 @@ pub fn test(
             let mut total_sent: usize = 0;
             let mut total_sent_bytes: usize = 0;
             let mut total_nack: usize = 0;
+            let mut retries = 0;
             loop {
+                if !load_send {
+                    let started = lock.lock().unwrap();
+                    cvar.wait_timeout(started, Duration::from_secs(3)).ok();
+                    let wdata = wlock_data.write().unwrap();
+                    if wdata.seq_no.load(Ordering::Relaxed) > 0 {
+                        send_all(&mut wserial, wdata, at_cmd, load_send);
+                        if retries < MAX_RETRIES {
+                            retries += 1;
+                            warn!("last send was NG. resending #{:02} ...", retries);
+                            continue;
+                        } else {
+                            total_nack += 1;
+                            error!("last send was NG. max retries reached.");
+                        }
+                    }
+                    retries = 0;
+                }
                 if !load_send {
                     let started = lock.lock().unwrap();
                     cvar.wait_timeout(
@@ -155,10 +174,6 @@ pub fn test(
                     .ok();
                 }
                 let mut wdata = wlock_data.write().unwrap();
-                if !load_send && wdata.seq_no.load(Ordering::Relaxed) > 0 {
-                    warn!("last send was NG");
-                    total_nack += 1;
-                }
 
                 seq_no += 1;
 
@@ -210,36 +225,14 @@ pub fn test(
                             hex::encode(&wdata.wbuf[..25]),
                             hex::encode(&wdata.wbuf[(wdata.wbuf.len() - 25)..])
                         );
+                        // trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
+                        trace!("send bin\n{}", hex::encode(&wdata.wbuf));
                     }
-                    // trace!("send txt\n{}", &wdata.wbuf.escape_ascii().to_string());
-                    trace!("send bin\n{}", hex::encode(&wdata.wbuf));
                 }
                 wdata.wbuf.push(AT_CMD);
                 total_sent_bytes += wdata.wbuf.len();
 
-                wserial.write_all(&wdata.wbuf).ok();
-                wserial.flush().ok();
-
-                #[cfg(feature = "async")]
-                if at_cmd {
-                    sleep(Duration::from_millis(50));
-                    wserial.write_all(&[AT_CMD]).ok();
-                    wserial.flush().ok();
-                    sleep(Duration::from_millis(200));
-                    let mut repeat_at_cmd = 1;
-                    while wserial.bytes_to_read().unwrap() == 0
-                        && repeat_at_cmd < wdata.wbuf.len() / 100 + 3
-                    {
-                        repeat_at_cmd += 1;
-                        sleep(Duration::from_millis(200));
-
-                        wserial.write_all(&[AT_CMD]).ok();
-                        wserial.flush().ok();
-                    }
-                    if !load_send {
-                        debug!("sent at_cmd {repeat_at_cmd} bytes");
-                    }
-                }
+                send_all(&mut wserial, wdata, at_cmd, load_send);
 
                 total_sent += 1;
                 if (!load_send && seq_no % 16 == 0) || seq_no % 1024 == 0 {
@@ -404,6 +397,35 @@ pub fn test(
     }
 }
 
+fn send_all(
+    wserial: &mut Box<dyn serialport::SerialPort>,
+    wdata: std::sync::RwLockWriteGuard<'_, WriteData>,
+    at_cmd: bool,
+    load_send: bool,
+) {
+    wserial.write_all(&wdata.wbuf).ok();
+    wserial.flush().ok();
+
+    #[cfg(feature = "async")]
+    if at_cmd {
+        sleep(Duration::from_millis(50));
+        wserial.write_all(&[AT_CMD]).ok();
+        wserial.flush().ok();
+        sleep(Duration::from_millis(200));
+        let mut repeat_at_cmd = 1;
+        while wserial.bytes_to_read().unwrap() == 0 && repeat_at_cmd < wdata.wbuf.len() / 100 + 3 {
+            repeat_at_cmd += 1;
+            sleep(Duration::from_millis(200));
+
+            wserial.write_all(&[AT_CMD]).ok();
+            wserial.flush().ok();
+        }
+        if !load_send {
+            debug!("sent at_cmd {repeat_at_cmd} bytes");
+        }
+    }
+}
+
 pub(crate) fn generate(length: usize) {
     let mut csum: u32 = 0;
     for i in 1..length {
@@ -460,7 +482,8 @@ mod test {
         let mut data = "
             1b1b007e00416867254e3ff0000000000000000000001b340018a0764ead1d30001b1b61040404
             bc024100ffffffffffff1b340000000002bbffffffffffff02bca0764ead1d301b1b04
-            121b344100ffffffffffff1b34000000001b3411ffffffffffff1b3412a0764ead1d301b3404"
+            121b344100ffffffffffff1b34000000001b3411ffffffffffff1b3412a0764ead1d301b3404
+            13007e00026867254e3ff00000001b3404"
             .to_string();
         data.retain(|c| !c.is_whitespace());
         let rbuf = hex::decode(data).unwrap();
@@ -488,7 +511,7 @@ mod test {
                                 recv_csum &= !AT_ESC_MASK as u32;
                             }
                         }
-                        if msg == 1 || msg == 2 {
+                        if matches!(msg, 1..4) {
                             assert_eq!(recv_end, i - 2);
                         } else {
                             assert_eq!(recv_end, i - 1);
