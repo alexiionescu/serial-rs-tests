@@ -1,10 +1,11 @@
+#!/usr/bin/env fish
 ## reset vars
 set -eU ESP_LIGHTS ESP_LIGHTS_TIMES
 ## test bed 103
 set HWID 6867254EED84
 ## test Bed 101 + CH 101
 set HWID 6867254E3FF0
-## test bed 108
+## test bed 103 + CH 103
 set HWID A0764EAD1D30
 # 6(CLEAR) pulse 500 -> 060205
 # 0(Dry1/Tamper) Pulse Test -- 2(Red/1st Cord) pulse/clear - 5(Assist) pulse/clear - 3(AUX3/2nd Cord) on/off - 0(Dry1/Tamper) on/off - 1(Dry2) pulse/clear - 6(CLEAR) pulse 500
@@ -18,3 +19,8 @@ set HWID 7CDFA1DEE298
 
 #command
 cargo run --release -- -vvv test -p /dev/cu.SLAB_USBtoUART10 --esp-test --send $ESP_LIGHTS --send-time $ESP_LIGHTS_TIMES
+
+# fast alarms (array version)
+set -U HWIDS 6867254E3FF0 A0764EAD1D30
+: test-esp-fast-alarm;for HWID in $HWIDS; set -U ESP_LIGHTS $ESP_LIGHTS 7E0002{$HWID}020205; set -U ESP_LIGHTS_TIMES $ESP_LIGHTS_TIMES 15; end
+: test-esp-fast-clear;for HWID in $HWIDS; set -U ESP_LIGHTS $ESP_LIGHTS 7E0002{$HWID}060205; set -U ESP_LIGHTS_TIMES $ESP_LIGHTS_TIMES 15; end
