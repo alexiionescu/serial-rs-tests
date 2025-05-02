@@ -1,5 +1,3 @@
-#![feature(vec_push_within_capacity)]
-
 use std::error::Error;
 
 use clap::{Args, Parser, Subcommand};
